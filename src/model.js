@@ -53,10 +53,14 @@ export function fmtTime(iso) {
 }
 export function windowContains(windows, start, end) {
   if (!windows || windows.length === 0) return true; // 无开放时段 = 全天开放
-  return windows.some((w) => w.start <= start && w.end >= end);
+  const s = new Date(start).getTime(), e = new Date(end).getTime();
+  return windows.some((w) => new Date(w.start).getTime() <= s && new Date(w.end).getTime() >= e);
 }
 export function overlaps(aS, aE, bS, bE) {
-  return aS < bE && bS < aE;
+  // 真实时刻比较：ISO 文本带不同时区偏移时不能按字符串排序
+  const as = new Date(aS).getTime(), ae = new Date(aE).getTime();
+  const bs = new Date(bS).getTime(), be = new Date(bE).getTime();
+  return as < be && bs < ae;
 }
 
 // ---------- 种子数据（相对当前时刻生成，保证逾期/未逾期各有样本）----------
@@ -200,15 +204,24 @@ export function actionIssues(state, action, opts = {}) {
   const issues = [];
   const loc = state.locations.find((l) => l.id === action.locationId);
   const unit = state.units.find((u) => u.id === action.unitId);
+  const officer = state.officers.find((o) => o.id === action.officerId);
+  const startMs = action.start ? new Date(action.start).getTime() : NaN;
+  const endMs = action.end ? new Date(action.end).getTime() : NaN;
 
   if (!action.start || !action.end) issues.push({ code: 'time', msg: '缺少开始或结束时段' });
-  else if (action.start >= action.end) issues.push({ code: 'time', msg: '结束时段早于开始时段' });
+  else if (isNaN(startMs) || isNaN(endMs)) issues.push({ code: 'time', msg: '时段不是合法时间' });
+  else if (startMs >= endMs) issues.push({ code: 'time', msg: '结束时段早于开始时段' });
 
   if (!unit) issues.push({ code: 'unit', msg: '未指定部队' });
-  if (!state.officers.find((o) => o.id === action.officerId)) issues.push({ code: 'officer', msg: '未指定负责人' });
+  if (!officer) issues.push({ code: 'officer', msg: '未指定负责人' });
   if (!loc) issues.push({ code: 'location', msg: '未指定目标地点' });
 
-  if (action.start && action.end && loc && !windowContains(loc.windows, action.start, action.end)) {
+  // 负责人必须属于所选部队（改派/导入后不一致都在此拦截）
+  if (unit && officer && officer.unitId !== unit.id) {
+    issues.push({ code: 'officer-unit', msg: `负责人「${officer.rank || ''} ${officer.name}」不属于部队「${unit.name}」`, with: { type: 'unit', id: unit.id } });
+  }
+
+  if (!isNaN(startMs) && !isNaN(endMs) && loc && !windowContains(loc.windows, startMs, endMs)) {
     issues.push({ code: 'window', msg: `超出地点「${loc.name}」的开放时段`, with: { type: 'location', id: loc.id } });
   }
 
@@ -314,6 +327,43 @@ export function planApproval(state, ids) {
   return { ok, blocked };
 }
 
+// 批量分派计划：改派后的部队/负责人必须一致；非草稿不允许改派调度归属
+export function planBatchAssign(state, ids, patch) {
+  const blocked = [];
+  const ok = [];
+  for (const id of ids) {
+    const a = state.actions.find((x) => x.id === id);
+    if (!a) continue;
+    const nextUnitId = patch.unitId || a.unitId;
+    const nextOfficerId = patch.officerId || a.officerId;
+    const issues = [];
+    if (a.status !== 'draft') {
+      issues.push({ code: 'not-draft', msg: `行动「${a.code} ${a.title}」当前为${STATUSES[a.status].label}，仅草稿可改派（请先撤回批准/重开）` });
+    }
+    if (patch.unitId) {
+      const u = state.units.find((x) => x.id === nextUnitId);
+      if (!u) issues.push({ code: 'unit', msg: '目标部队不存在' });
+      else if (patch.officerId) {
+        const o = state.officers.find((x) => x.id === nextOfficerId);
+        if (!o || o.unitId !== u.id) issues.push({ code: 'officer-unit', msg: `负责人「${o?.name || nextOfficerId}」不属于部队「${u.name}」` });
+      } else {
+        // 换部队时必须同时指定属于新部队的负责人，避免留下“新部队 + 旧负责人”的不一致
+        const oldOfficer = state.officers.find((x) => x.id === nextOfficerId);
+        if (!oldOfficer || oldOfficer.unitId !== u.id) {
+          issues.push({ code: 'officer-required', msg: `改派到部队「${u.name}」时必须同时选择该部队的负责人（原负责人 ${oldOfficer ? `「${oldOfficer.name}」不属该部队` : '缺失'}）` });
+        }
+      }
+    } else if (patch.officerId) {
+      const o = state.officers.find((x) => x.id === nextOfficerId);
+      const u = state.units.find((x) => x.id === nextUnitId);
+      if (o && u && o.unitId !== u.id) issues.push({ code: 'officer-unit', msg: `负责人「${o.name}」不属于行动当前部队「${u.name}」` });
+    }
+    if (issues.length) blocked.push({ id, code: a.code, title: a.title, issues });
+    else ok.push(id);
+  }
+  return { ok, blocked };
+}
+
 // 行动状态机
 export const TRANSITIONS = {
   draft: ['approved'],
@@ -403,12 +453,16 @@ export function reducer(state, action) {
     }
     case 'action/batchAssign': {
       const { ids, patch } = action;
+      // 防御：任何入口都不允许把负责人改成与部队不一致
+      const { ok } = planBatchAssign(state, ids, patch);
+      if (!ok.length) return withEntry(state, null);
+      const okSet = new Set(ok);
       const parts = [];
       if (patch.unitId) parts.push('更换部队');
       if (patch.officerId) parts.push('更换负责人');
       if (patch.priority !== undefined) parts.push(`调整优先级为 P${patch.priority}`);
-      const next = { ...state, actions: state.actions.map((a) => (ids.includes(a.id) ? { ...a, ...patch } : a)) };
-      return withEntry(next, { kind: 'batch', text: `批量分派 ${ids.length} 个行动（${parts.join('、') || '无变更'}）` });
+      const next = { ...state, actions: state.actions.map((a) => (okSet.has(a.id) ? { ...a, ...patch } : a)) };
+      return withEntry(next, { kind: 'batch', text: `批量分派 ${ok.length} 个行动（${parts.join('、') || '无变更'}）` });
     }
     case 'action/batchApprove': {
       const { ids } = action;

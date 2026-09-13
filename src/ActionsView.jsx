@@ -2,7 +2,7 @@ import React, { useMemo, useState, useEffect } from 'react';
 import { useStore, useNow } from './store.jsx';
 import { useToast } from './ui.jsx';
 import {
-  STATUSES, isOverdue, planApproval, actionIssues, canTransition,
+  STATUSES, isOverdue, planApproval, planBatchAssign, actionIssues, canTransition,
   fmtTime, byId, supplyUsage,
 } from './model.js';
 import { StatusBadge, Modal, Field, ConfirmModal } from './ui.jsx';
@@ -364,38 +364,56 @@ function ReopenModal({ action, onCancel, onConfirm }) {
 function BatchAssignModal({ ids, onClose, onDone }) {
   const store = useStore();
   const { state } = store;
+  const toast = useToast();
   const acts = byId(state.actions);
+  const units = byId(state.units);
   const [unitId, setUnitId] = useState('');
   const [officerId, setOfficerId] = useState('');
   const [priority, setPriority] = useState('');
-  const officersOfUnit = unitId ? state.officers.filter((o) => o.unitId === unitId) : [];
+  const [errors, setErrors] = useState(null);
+
+  // 目标部队：显式选择优先；否则取所选行动当前部队的并集
+  const targetUnitIds = unitId
+    ? [unitId]
+    : [...new Set(ids.map((id) => acts[id]?.unitId).filter(Boolean))];
+  const eligibleOfficers = state.officers.filter((o) => targetUnitIds.includes(o.unitId));
+
+  const apply = () => {
+    const patch = {};
+    if (unitId) patch.unitId = unitId;
+    if (officerId) patch.officerId = officerId;
+    if (priority) patch.priority = Number(priority);
+    if (!Object.keys(patch).length) { toast('没有选择任何要修改的字段', 'error'); return; }
+    // 归属校验：负责人必须属于（新）部队；换部队必须同时给新部队的负责人
+    const { blocked } = planBatchAssign(state, ids, patch);
+    if (blocked.length) { setErrors(blocked); return; }
+    onDone(patch, `批量分派 ${ids.length} 个行动`);
+  };
 
   return (
-    <Modal title={`批量分派 ${ids.length} 个草稿行动`} sub="仅修改已选草稿；留空的字段保持不变。"
+    <Modal title={`批量分派 ${ids.length} 个草稿行动`} sub="仅修改已选草稿；留空的字段保持不变。改派部队时必须同时选择属于该部队的负责人。"
       onClose={onClose}
       footer={<>
         <button className="btn" onClick={onClose}>取消</button>
-        <button className="btn btn-primary" data-testid="assign-confirm"
-          onClick={() => {
-            const patch = {};
-            if (unitId) patch.unitId = unitId;
-            if (officerId) patch.officerId = officerId;
-            if (priority) patch.priority = Number(priority);
-            if (!Object.keys(patch).length) return;
-            onDone(patch, `批量分派 ${ids.length} 个行动`);
-          }}>应用分派</button>
+        <button className="btn btn-primary" data-testid="assign-confirm" onClick={apply}>应用分派</button>
       </>}>
+      {errors && (
+        <div className="alert alert-error" data-testid="assign-errors">
+          <b>{errors.length} 个行动无法这样分派：</b>
+          <ul>{errors.flatMap((b) => b.issues.map((i, k) => <li key={b.id + k}><b>{b.code}</b>：{i.msg}</li>))}</ul>
+        </div>
+      )}
       <div className="form-grid">
         <Field label="改派部队">
-          <select className="inp" value={unitId} onChange={(e) => { setUnitId(e.target.value); setOfficerId(''); }} data-testid="assign-unit">
+          <select className="inp" value={unitId} onChange={(e) => { setUnitId(e.target.value); setOfficerId(''); setErrors(null); }} data-testid="assign-unit">
             <option value="">不变</option>
             {state.units.map((u) => <option key={u.id} value={u.id}>{u.name}</option>)}
           </select>
         </Field>
-        <Field label="改派负责人" hint={unitId && !officersOfUnit.length ? '该部队暂无在编军官' : undefined}>
-          <select className="inp" value={officerId} onChange={(e) => setOfficerId(e.target.value)} data-testid="assign-officer" disabled={!unitId}>
-            <option value="">{unitId ? '不变' : '请先选择部队'}</option>
-            {officersOfUnit.map((o) => <option key={o.id} value={o.id}>{o.rank} {o.name}</option>)}
+        <Field label={unitId ? '新部队的负责人（必选）' : '改派负责人（限各行动当前部队）'}>
+          <select className="inp" value={officerId} onChange={(e) => { setOfficerId(e.target.value); setErrors(null); }} data-testid="assign-officer">
+            <option value="">不变</option>
+            {eligibleOfficers.map((o) => <option key={o.id} value={o.id}>{units[o.unitId]?.name} · {o.rank} {o.name}</option>)}
           </select>
         </Field>
         <Field label="统一优先级">
@@ -406,7 +424,7 @@ function BatchAssignModal({ ids, onClose, onDone }) {
         </Field>
       </div>
       <div className="assign-preview">
-        {ids.map((id) => <span key={id} className="chip">{acts[id]?.code} {acts[id]?.title}</span>)}
+        {ids.map((id) => <span key={id} className="chip">{acts[id]?.code} {acts[id]?.title}（{units[acts[id]?.unitId]?.name}）</span>)}
       </div>
     </Modal>
   );

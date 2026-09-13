@@ -75,6 +75,12 @@ export default function ImportExportView() {
               onClick={() => { const r = validateImport(BAD_VERSION); if (!r.ok) setBad({ errors: r.errors, warnings: r.warnings, fileName: '错误版本.json' }); }}>载入：错误版本号</button>
             <button className="btn btn-mini" data-testid="sample-baditems"
               onClick={() => { const r = validateImport(BAD_ITEMS); if (!r.ok) setBad({ errors: r.errors, warnings: r.warnings, fileName: '多项错误.json' }); }}>载入：逐项错误（悬空引用/负库存/环/时段）</button>
+            <button className="btn btn-mini" data-testid="sample-badstatus"
+              onClick={() => { const r = validateImport(BAD_STATUS); if (!r.ok) setBad({ errors: r.errors, warnings: r.warnings, fileName: '既定状态冲突.json' }); else setReview({ result: r, fileName: '既定状态冲突.json' }); }}>载入：已批准行动互相冲突</button>
+            <button className="btn btn-mini" data-testid="sample-tzbad"
+              onClick={() => { const r = validateImport(TZ_OFFSET_BAD); if (!r.ok) setBad({ errors: r.errors, warnings: r.warnings, fileName: '时区伪装.json' }); else setReview({ result: r, fileName: '时区伪装.json' }); }}>载入：时区偏移伪装在窗内</button>
+            <button className="btn btn-mini" data-testid="sample-tzgood"
+              onClick={() => { const r = validateImport(TZ_OFFSET_GOOD); if (r.ok) setReview({ result: r, fileName: '时区合法样本.json' }); else setBad({ errors: r.errors, warnings: r.warnings, fileName: '时区合法样本.json' }); }}>载入：偏移文本不同但真实时刻在窗内</button>
           </div>
         </div>
       </section>
@@ -179,3 +185,40 @@ const BAD_ITEMS = docOf({
       unitId: 'unit-1', officerId: 'off-1', locationId: 'loc-1', deps: ['act-1'], priority: 2, costs: [] },
   ],
 });
+
+// 结构全部合法，但文件中“已批准”的行动互相冲突 —— 必须整库拒绝并指出行动路径
+const DOC_FIXED = (actions) => JSON.stringify({
+  app: 'campaign-console', version: DOC_VERSION, exportedAt: '2026-09-13T00:00:00Z',
+  data: {
+    factions: [{ id: 'fac-1', name: '蓝方', code: 'BLU', color: '#4a7ab8' }],
+    units: [{ id: 'u1', name: '一营', factionId: 'fac-1', strength: 100 },
+            { id: 'u2', name: '二营', factionId: 'fac-1', strength: 100 }],
+    officers: [{ id: 'o1', name: '甲军官', rank: '上尉', unitId: 'u1' },
+               { id: 'o2', name: '乙军官', rank: '中尉', unitId: 'u2' }],
+    // 仅 08:00–10:00Z 开放
+    locations: [{ id: 'l1', name: '窄窗阵地', kind: '阵地',
+      windows: [{ start: '2026-09-13T08:00Z', end: '2026-09-13T10:00Z' }] }],
+    supplies: [{ id: 's1', name: '燃油', unit: '桶', stock: 5 }],
+    actions,
+  },
+}, null, 2);
+const fixedAct = (id, over) => ({
+  id, code: id.toUpperCase(), title: id, status: 'approved',
+  start: '2026-09-13T08:00Z', end: '2026-09-13T09:00Z',
+  unitId: 'u1', officerId: 'o1', locationId: 'l1', deps: [], priority: 2, costs: [], note: '', ...over,
+});
+const BAD_STATUS = DOC_FIXED([
+  fixedAct('a1', { costs: [{ supplyId: 's1', qty: 10 }] }),                 // 物资不足（库存 5）
+  fixedAct('a2', { start: '2026-09-13T08:30Z', end: '2026-09-13T09:30Z' }), // 与 a1 同时段同部队
+  fixedAct('a3', { start: '2026-09-13T09:00Z', end: '2026-09-13T09:30Z', deps: ['a4'] }), // 依赖草稿
+  fixedAct('a4', { status: 'draft', unitId: 'u2', officerId: 'o2', start: '2026-09-13T06:00Z', end: '2026-09-13T07:00Z' }),
+  fixedAct('a5', { unitId: 'u2', officerId: 'o2', start: '2026-09-13T11:00Z', end: '2026-09-13T12:00Z' }), // 超出开放时段
+]);
+// 文本上是 09:00（看似在 08–10 窗内），-10 偏移后真实时刻为前一天 19:00Z
+const TZ_OFFSET_BAD = DOC_FIXED([
+  fixedAct('a1', { start: '2026-09-13T09:00-10:00', end: '2026-09-13T09:30-10:00' }),
+]);
+// 文本上是 19:00（看似晚于窗口），+10 偏移后真实时刻为 09:00Z，实际在窗内
+const TZ_OFFSET_GOOD = DOC_FIXED([
+  fixedAct('a1', { start: '2026-09-13T19:00+10:00', end: '2026-09-13T19:30+10:00' }),
+]);

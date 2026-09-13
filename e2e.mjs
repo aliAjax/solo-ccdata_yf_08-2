@@ -154,6 +154,52 @@ check('重做：分派再次生效', (await row(page, 'act-a4').textContent()).i
 await page.locator('[data-testid="undo"]').click();
 await sleep(100);
 
+// ---- 3b. 批量分派归属校验（改派后负责人必须属于新部队）----
+// 只选 A-04（第 3 步兵营 / 安然）
+await page.locator('[data-testid="select-act-a4"]').check();
+await page.locator('[data-testid="batch-assign"]').click();
+await page.waitForSelector('[data-testid="assign-unit"]');
+// 负责人下拉只列当前部队（步兵 3 营）的军官：有安然、没有林泽
+let officerOpts = await page.locator('[data-testid="assign-officer"] option').evaluateAll((os) => os.map((o) => o.textContent));
+check('负责人下拉仅含所选行动当前部队的军官（有安然、无林泽）',
+  officerOpts.some((t) => t.includes('安然')) && !officerOpts.some((t) => t.includes('林泽')));
+// 改派部队到装甲营但负责人“不变”（安然不属装甲营）→ 必须拦截
+await page.selectOption('[data-testid="assign-unit"]', 'unit-armor7');
+await page.locator('[data-testid="assign-confirm"]').click();
+await page.waitForSelector('[data-testid="assign-errors"]');
+let assignErr = await page.locator('[data-testid="assign-errors"]').textContent();
+check('只换部队不换负责人被拦截（要求同选新部队负责人）', assignErr.includes('负责人') && assignErr.includes('第 7 装甲营'));
+check('被拦截后 A-04 部队不变', (await row(page, 'act-a4').textContent()).includes('第 3 步兵营'));
+// 选择属于装甲营的林泽后可以分派
+await page.selectOption('[data-testid="assign-officer"]', 'off-linze');
+await page.locator('[data-testid="assign-confirm"]').click();
+await sleep(100);
+check('改派装甲营 + 林泽成功（归属一致）',
+  (await row(page, 'act-a4').textContent()).includes('第 7 装甲营') && (await row(page, 'act-a4').textContent()).includes('林泽'));
+await page.locator('[data-testid="undo"]').click();
+await sleep(100);
+check('撤销后 A-04 回到步兵 3 营 / 安然',
+  (await row(page, 'act-a4').textContent()).includes('第 3 步兵营') && (await row(page, 'act-a4').textContent()).includes('安然'));
+
+// 多选两个不同部队的草稿（A-04 步兵3营、A-05 装甲营），负责人下拉只列这两支部队的军官
+await page.locator('[data-testid="select-act-a4"]').check();
+await page.locator('[data-testid="select-act-a5"]').check();
+await page.locator('[data-testid="batch-assign"]').click();
+await page.waitForSelector('[data-testid="assign-priority"]');
+officerOpts = await page.locator('[data-testid="assign-officer"] option').evaluateAll((os) => os.map((o) => o.textContent));
+check('多选跨部队草稿：负责人下拉只含相关部队军官（安然、林泽），无叶柒（侦察连未选）',
+  officerOpts.some((t) => t.includes('安然')) && officerOpts.some((t) => t.includes('林泽')) && !officerOpts.some((t) => t.includes('叶柒')));
+// 不改部队、选林泽：对 A-04（步兵3营）不一致 → 整单拦截
+await page.selectOption('[data-testid="assign-officer"]', 'off-linze');
+await page.locator('[data-testid="assign-confirm"]').click();
+await page.waitForSelector('[data-testid="assign-errors"]');
+check('给不同部队的行动统一指派不匹配负责人 → 整单拦截',
+  (await page.locator('[data-testid="assign-errors"]').textContent()).includes('不属于'));
+await page.locator('.modal-foot .btn').first().click();
+await page.locator('[data-testid="select-act-a4"]').uncheck().catch(() => {});
+await page.locator('[data-testid="select-act-a5"]').uncheck().catch(() => {});
+check('整单拦截后 A-04 负责人未变（仍安然）', (await row(page, 'act-a4').textContent()).includes('安然'));
+
 // ---------- 5. 排序与筛选 ----------
 await page.selectOption('[data-testid="sort-by"]', 'code');
 await sleep(50);
@@ -195,6 +241,32 @@ check('包含负库存、重复 id、成环、时间倒挂、非法日期',
   errText.includes('stock') && errText.includes('重复') && errText.includes('成环') && errText.includes('start'));
 await page.screenshot({ path: '/workspace/e2e-import-errors.png' });
 await page.locator('[data-testid="bad-close"]').click();
+
+// 6c. 既定状态冲突：结构合法但“已批准”行动互相冲突 → 整库拒绝，路径指向具体行动
+await page.locator('[data-testid="sample-badstatus"]').click();
+await page.waitForSelector('[data-testid="import-errors"]');
+let stErr = await page.locator('[data-testid="import-errors"]').textContent();
+check('既定状态冲突被拒：同时段同部队', stErr.includes('同时段'));
+check('既定状态冲突被拒：依赖草稿', stErr.includes('草稿'));
+check('既定状态冲突被拒：物资不足并给余量', stErr.includes('物资') && stErr.includes('剩余可用 5'));
+check('既定状态冲突被拒：超出开放时段', stErr.includes('开放时段'));
+check('错误路径精确到行动下标（$.data.actions[0]）', stErr.includes('$.data.actions[0]'));
+check('错误带既定状态标记 [既定状态=approved]', stErr.includes('[既定状态=approved]'));
+await page.locator('[data-testid="bad-close"]').click();
+
+// 6d. 时区偏移伪装在窗内 → 仍按真实时刻拒绝
+await page.locator('[data-testid="sample-tzbad"]').click();
+await page.waitForSelector('[data-testid="import-errors"]');
+let tzErr = await page.locator('[data-testid="import-errors"]').textContent();
+check('时区伪装样本被拒（-10 偏移实际在窗外）', tzErr.includes('开放时段') && tzErr.includes('$.data.actions[0]'));
+await page.locator('[data-testid="bad-close"]').click();
+
+// 6e. 偏移文本不同但真实时刻在窗内 → 通过并进入确认（随后取消，不替换）
+await page.locator('[data-testid="sample-tzgood"]').click();
+await page.waitForSelector('[data-testid="import-counts"]');
+check('时区合法样本通过校验（真实时刻在窗内）', (await page.locator('[data-testid="import-counts"]').textContent()).includes('行动'));
+await page.locator('[data-testid="import-cancel"]').click();
+check('取消后现有数据未被替换（仍 10 个行动）', (await page.locator('[data-testid="io-import"]').count()) === 1);
 
 // 失败后现有数据未变（回到行动视图仍是 10 行）
 await page.locator('[data-testid="nav-actions"]').click();
